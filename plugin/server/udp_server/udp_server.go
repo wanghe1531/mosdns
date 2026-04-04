@@ -215,6 +215,7 @@ type fastHandler struct {
 }
 
 func (h *fastHandler) Handle(ctx context.Context, q *dns.Msg, meta server.QueryMeta, pack func(*dns.Msg) (*[]byte, error)) *[]byte {
+	meta.ClientAddr = meta.ClientAddr.Unmap()
 	payload := h.next.Handle(ctx, q, meta, pack)
 
 	if (meta.PreFastFlags & asyncRefreshMark) != 0 {
