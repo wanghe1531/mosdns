@@ -1692,7 +1692,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     sysPromises.push(cacheManager.updateStats(signal));
                     sysPromises.push(switchManager.loadStatus(signal));
                     sysPromises.push(systemInfoManager.load(signal));
-                    sysPromises.push(updateManager.refreshStatus(false));
+//                    sysPromises.push(updateManager.refreshStatus(false));
                 }
                 
                 if (sysPromises.length > 0) {
@@ -4069,7 +4069,11 @@ const handleInteractiveClick = (e) => {
 
         const watch = (selector, fn) => { const el = document.querySelector(selector); if (!el) return; map.set(el, fn); io.observe(el); };
         watch('#system-info-module', () => systemInfoManager.load());
-        watch('#update-module', () => updateManager.refreshStatus(false));
+        watch('#update-module', () => {
+            if (state.update.status) {
+                updateManager.updateStatusUI(state.update.status);
+            }
+        });
         watch('#feature-switches-module', () => switchManager.loadStatus());
         watch('#domain-stats-module', () => updateDomainListStats());
         watch('#requery-module', () => requeryManager.updateStatus());
@@ -4124,7 +4128,7 @@ const handleInteractiveClick = (e) => {
                 Promise.allSettled([
                     switchManager.loadStatus(),
                     overridesManager.load(true),
-                    updateManager.refreshStatus(false)
+//                    updateManager.refreshStatus(false)
                 ]).catch(() => { });
             }, 500);
         }
@@ -4352,5 +4356,3 @@ document.addEventListener('DOMContentLoaded', function () {
         }
     }
 });
-
-
