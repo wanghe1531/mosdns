@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/maphash"
-//	"log"
 	"net"
 	"net/netip"
 	"sync"
@@ -25,8 +24,11 @@ import (
 
 const (
 	PluginType       = "udp_server"
-	cacheSize        = 65536
-	cacheMask        = cacheSize - 1
+	cacheSize        = 4194304 
+	assoc            = 4
+	groupCount       = cacheSize / assoc
+	groupMask        = groupCount - 1
+
 	internalTTL      = 5
 	clientTTL        = 10
 	asyncRefreshMark = 1 << 60
@@ -73,14 +75,15 @@ type eBpfCacheVal struct {
 }
 
 type fastCacheItem struct {
+	hash      uint32 
 	expire    int64
-	resp[]byte
+	resp      []byte
 	updating  uint32
 	domainSet string
 }
 
 type fastCache struct {
-	m       [cacheSize]atomic.Pointer[fastCacheItem]
+	m       [groupCount][assoc]atomic.Pointer[fastCacheItem]
 	ebpfMap *ebpf.Map
 	ebpfMu  sync.Mutex
 }
@@ -108,13 +111,10 @@ func (fc *fastCache) getEbpfMap() *ebpf.Map {
 	return fc.ebpfMap
 }
 
-func calcFNV1a(data[]byte) uint32 {
+func calcFNV1a(data []byte) uint32 {
 	h := uint32(0x811c9dc5)
 	n := len(data)
 	for i, b := range data {
-		if i >= 128 {
-			break
-		}
 		if i < n-4 && b >= 'A' && b <= 'Z' {
 			b += 32
 		}
@@ -125,7 +125,18 @@ func calcFNV1a(data[]byte) uint32 {
 }
 
 func (fc *fastCache) GetOrUpdating(hash uint64, reqLen int, buf []byte) (int, int, uint64, string) {
-	ptr := fc.m[hash&cacheMask].Load()
+	groupIdx := hash & uint64(groupMask)
+	group := &fc.m[groupIdx]
+
+	var ptr *fastCacheItem
+	for i := 0; i < assoc; i++ {
+		item := group[i].Load()
+		if item != nil && item.hash == uint32(hash) {
+			ptr = item
+			break
+		}
+	}
+
 	if ptr == nil {
 		return server.FastActionContinue, 0, 0, ""
 	}
@@ -157,7 +168,7 @@ func (fc *fastCache) Store(resp []byte, dset string) {
 		}
 	}
 
-	if len(bakedResp) <= 16 {
+	if len(bakedResp) <= 16 || len(bakedResp) > 512 {
 		return
 	}
 
@@ -196,13 +207,45 @@ func (fc *fastCache) Store(resp []byte, dset string) {
 				em.Put(&hash, &val)
 			}
 
-			item := &fastCacheItem{
+			newItem := &fastCacheItem{
+				hash:      hash,
 				resp:      bakedResp,
 				expire:    time.Now().Add(internalTTL * time.Second).Unix(),
 				updating:  0,
 				domainSet: dset,
 			}
-			fc.m[uint64(hash)&cacheMask].Store(item)
+
+			groupIdx := uint64(hash) & uint64(groupMask)
+			group := &fc.m[groupIdx]
+
+			for i := 0; i < assoc; i++ {
+				old := group[i].Load()
+				if old != nil && old.hash == hash {
+					group[i].Store(newItem)
+					return
+				}
+			}
+
+			for i := 0; i < assoc; i++ {
+				if group[i].Load() == nil {
+					if group[i].CompareAndSwap(nil, newItem) {
+						return
+					}
+				}
+			}
+
+			oldestIdx := 0
+			var minExpire int64 = 1<<63 - 1 
+			
+			for i := 0; i < assoc; i++ {
+			    item := group[i].Load()
+			    if item == nil { continue } 
+			    if exp := atomic.LoadInt64(&item.expire); exp < minExpire {
+			        minExpire = exp
+			        oldestIdx = i
+			    }
+			}
+			group[oldestIdx].Store(newItem)
 		}
 	}
 }
@@ -281,7 +324,6 @@ func startRingbufListener(bp *coremain.BP, h *fastHandler, rd *ringbuf.Reader) {
 			return &b, err
 		}
 
-//		log.Printf("[Go-Ringbuf] Triggering async refresh for Stale Cache.")
 		h.Handle(context.Background(), msg, meta, packFunc)
 	}
 }
@@ -376,7 +418,7 @@ func buildFastBypass(bp *coremain.BP, fc *fastCache, conn *net.UDPConn) func(int
 	var dm DomainMapperPlugin
 	var ipSet IPSetPlugin
 
-	return func(reqLen int, buf[]byte, remoteAddr netip.AddrPort) (int, int, uint64, string) {
+	return func(reqLen int, buf []byte, remoteAddr netip.AddrPort) (int, int, uint64, string) {
 		once.Do(func() {
 			if p := bp.M().GetPlugin("switch15"); p != nil {
 				sw15, _ = p.(SwitchPlugin)
@@ -525,7 +567,16 @@ func buildFastBypass(bp *coremain.BP, fc *fastCache, conn *net.UDPConn) func(int
 		qRawBytes := buf[12:q_end]
 		hKey := calcFNV1a(qRawBytes)
 
-		ptr := fc.m[uint64(hKey)&cacheMask].Load()
+		groupIdx := uint64(hKey) & uint64(groupMask)
+		group := &fc.m[groupIdx]
+		var ptr *fastCacheItem
+		for i := 0; i < assoc; i++ {
+			item := group[i].Load()
+			if item != nil && item.hash == hKey {
+				ptr = item
+				break
+			}
+		}
 
 		if ptr != nil {
 			now := time.Now().Unix()
@@ -557,7 +608,7 @@ func buildFastBypass(bp *coremain.BP, fc *fastCache, conn *net.UDPConn) func(int
 	}
 }
 
-func makeReject(reqLen int, buf[]byte, offset int, rcode byte) int {
+func makeReject(reqLen int, buf []byte, offset int, rcode byte) int {
 	if offset > reqLen {
 		offset = reqLen
 	}
@@ -570,7 +621,7 @@ func makeReject(reqLen int, buf[]byte, offset int, rcode byte) int {
 	return offset
 }
 
-func findTTLOffsets(msg[]byte)[]int {
+func findTTLOffsets(msg []byte) []int {
 	if len(msg) < 12 {
 		return nil
 	}
@@ -595,7 +646,7 @@ func findTTLOffsets(msg[]byte)[]int {
 		}
 		offset += 4
 	}
-	var offsets[]int
+	var offsets []int
 	for i := 0; i < int(ancount); i++ {
 		for offset < len(msg) {
 			l := int(msg[offset])
