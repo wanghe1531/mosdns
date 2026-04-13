@@ -28,6 +28,8 @@ type NftConfig struct {
 	Table        string `yaml:"table_name"`
 	SetV4        string `yaml:"set_v4"`
 	SetV6        string `yaml:"set_v6"`
+	MihomoSetV4    string `yaml:"mihomo_set_v4"` 
+	MihomoSetV6    string `yaml:"mihomo_set_v6"`
 	FixIPFile    string `yaml:"fixip"`
 	NftConfFile  string `yaml:"nftfile"`
 	PureNftFile  string `yaml:"purenft"` 
