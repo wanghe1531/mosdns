@@ -95,6 +95,8 @@ type NftConfig struct {
 	Table        string `yaml:"table_name"`
 	SetV4        string `yaml:"set_v4"`
 	SetV6        string `yaml:"set_v6"`
+	MihomoSetV4    string `yaml:"mihomo_set_v4"` 
+	MihomoSetV6    string `yaml:"mihomo_set_v6"`
 	FixIPFile    string `yaml:"fixip"`
 	NftConfFile  string `yaml:"nftfile"`
 	PureNftFile  string `yaml:"purenft"`
@@ -181,6 +183,12 @@ func newNftAdd(bp *coremain.BP, args any) (any, error) {
 		ctx:             ctx,
 		cancel:          cancel,
 	}
+    if p.nftArgs.MihomoSetV4 == "" {
+        p.nftArgs.MihomoSetV4 = "mihomo_ipv4"
+    }
+    if p.nftArgs.MihomoSetV6 == "" {
+        p.nftArgs.MihomoSetV6 = "mihomo_ipv6"
+    }
 	p.matcher.Store(netlist.NewList())
 
 	if err := p.loadConfig(); err != nil {
@@ -346,7 +354,15 @@ func (p *NftAdd) flushAndFillSets(ipSet *netipx.IPSet) error {
 			script.WriteString(fmt.Sprintf("add element %s %s %s { %s }\n", p.nftArgs.TableFamily, p.nftArgs.Table, p.nftArgs.SetV6, strings.Join(v6List, ", ")))
 		}
 	}
+    if p.nftArgs.MihomoFakeIPv4 != "" {
+        script.WriteString(fmt.Sprintf("flush set %s %s %s\n", p.nftArgs.TableFamily, p.nftArgs.Table, p.nftArgs.MihomoSetV4))
+        script.WriteString(fmt.Sprintf("add element %s %s %s { %s }\n", p.nftArgs.TableFamily, p.nftArgs.Table, p.nftArgs.MihomoSetV4, p.nftArgs.MihomoFakeIPv4))
+    }
 
+    if p.nftArgs.MihomoFakeIPv6 != "" {
+        script.WriteString(fmt.Sprintf("flush set %s %s %s\n", p.nftArgs.TableFamily, p.nftArgs.Table, p.nftArgs.MihomoSetV6))
+        script.WriteString(fmt.Sprintf("add element %s %s %s { %s }\n", p.nftArgs.TableFamily, p.nftArgs.Table, p.nftArgs.MihomoSetV6, p.nftArgs.MihomoFakeIPv6))
+    }
 	if script.Len() == 0 {
 		return nil
 	}
