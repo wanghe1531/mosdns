@@ -36,11 +36,10 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-//go:embed proxy.o
+//go:embed combined.o
 var ebpfProg []byte
-
-//go:embed dnscache.o
-var dnsProg []byte
+//go:embed xdp_dns.o
+var xdpEbpfProg []byte
 
 const (
 	PluginType      = "nft_add"
@@ -111,6 +110,8 @@ type NftConfig struct {
 	DnsHijack  string `yaml:"dns_hijack"`
 	HijackDip4 string `yaml:"hjack_dip4"`
 	HijackDip6 string `yaml:"hjack_dip6"`
+        EbpfXdp        string `yaml:"xdp_enable"`
+                EbpfXdpIface   string `yaml:"xdp_iface"`
 }
 
 type RuleSource struct {
@@ -136,10 +137,11 @@ type NftAdd struct {
 	ctx             context.Context
 	cancel          context.CancelFunc
 
-	startupDone atomic.Bool
-	ebpfLinks   []link.Link
-	ebpfMap     *ebpf.Map
-	dnsPrograms []*ebpf.Program
+	startupDone  atomic.Bool
+	ebpfLinks    []link.Link
+	ebpfMap      *ebpf.Map
+	ebpfPrograms []*ebpf.Program
+    xdpLink      link.Link
 }
 
 var _ data_provider.IPMatcherProvider = (*NftAdd)(nil)
@@ -220,17 +222,21 @@ func (p *NftAdd) Close() error {
 	log.Printf("[%s] closing...", PluginType)
 	p.cancel()
 
+	if p.xdpLink != nil {
+		p.xdpLink.Close()
+	}
+
 	for _, l := range p.ebpfLinks {
 		l.Close()
 	}
-	for _, prg := range p.dnsPrograms {
+	for _, prg := range p.ebpfPrograms {
 		prg.Close()
 	}
 
 	os.Remove("/sys/fs/bpf/mosdns_fast_cache")
 	os.Remove("/sys/fs/bpf/mosdns_ringbuf")
-	os.Remove("/sys/fs/bpf/mosdns_dns_jmp")
 	os.Remove("/sys/fs/bpf/mosdns_jmp_dns")
+	os.Remove("/sys/fs/bpf/mosdns_dns_jmp")
 	
 	p.cleanupRouting()
 	return nil
@@ -445,110 +451,121 @@ func (p *NftAdd) packLpmKey(prefix netip.Prefix) []byte {
 func (p *NftAdd) setupEbpf(ipSet *netipx.IPSet) error {
 	p.setupRouting()
 	os.MkdirAll("/sys/fs/bpf", 0755)
+
 	lan, err := net.InterfaceByName(p.nftArgs.EbpfIface)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to find main interface %s: %w", p.nftArgs.EbpfIface, err)
 	}
 
-	specDNS, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(dnsProg))
+	xdpIfaceName := p.nftArgs.EbpfXdpIface
+	if xdpIfaceName == "" {
+		xdpIfaceName = p.nftArgs.EbpfIface
+	}
+	xdpLan, err := net.InterfaceByName(xdpIfaceName)
+	if err != nil {
+		return fmt.Errorf("failed to find xdp interface %s: %w", xdpIfaceName, err)
+	}
+
+	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(ebpfProg))
 	if err != nil {
 		return err
 	}
 
-	for _, prog := range specDNS.Programs {
+	for _, prog := range spec.Programs {
 		prog.Type = ebpf.SchedCLS
 		prog.AttachType = 0
 	}
 
-	dnsConsts := make(map[string]interface{})
-	if p.nftArgs.EbpfEnable == "ebpf_true" && p.nftArgs.DnsHijack == "ebpf_hijack" {
-		if addr, err := netip.ParseAddr(p.nftArgs.HijackDip4); err == nil && addr.Is4() {
-			b := addr.As4()
-			dnsConsts["hjack_dip4"] = binary.LittleEndian.Uint32(b[:])
-			dnsConsts["enable_dns_hijack"] = uint8(1)
-		}
-	}
-	if len(dnsConsts) > 0 {
-		specDNS.RewriteConstants(dnsConsts)
-	}
-
-	var objsDNS struct {
-		DnsMain       *ebpf.Program `ebpf:"tc_dns_main"`
-		DnsResp       *ebpf.Program `ebpf:"tc_dns_resp"`
-		FastDnsCache  *ebpf.Map     `ebpf:"fast_dns_cache"`
-		RingbufEvents *ebpf.Map     `ebpf:"ringbuf_events"`
-		DnsJmp        *ebpf.Map     `ebpf:"dns_jmp"`
-	}
-	if err := specDNS.LoadAndAssign(&objsDNS, nil); err != nil {
-		return fmt.Errorf("load dnscache error: %w", err)
-	}
-
-	p.dnsPrograms = append(p.dnsPrograms, objsDNS.DnsMain, objsDNS.DnsResp)
-
-	key0 := uint32(0)
-	valResp := uint32(objsDNS.DnsResp.FD())
-	if err := objsDNS.DnsJmp.Update(&key0, &valResp, ebpf.UpdateAny); err != nil {
-		return fmt.Errorf("failed to link dns main to resp: %w", err)
-	}
-
-	_ = objsDNS.FastDnsCache.Pin("/sys/fs/bpf/mosdns_fast_cache")
-	_ = objsDNS.RingbufEvents.Pin("/sys/fs/bpf/mosdns_ringbuf")
-	
-	os.Remove("/sys/fs/bpf/mosdns_dns_jmp")
-	_ = objsDNS.DnsJmp.Pin("/sys/fs/bpf/mosdns_dns_jmp")
-
-	specProxy, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(ebpfProg))
-	if err != nil {
-		return err
-	}
-
-	for _, prog := range specProxy.Programs {
-		prog.Type = ebpf.SchedCLS
-		prog.AttachType = 0
-	}
-
-	proxyConsts := make(map[string]interface{})
+	ebpfConsts := make(map[string]interface{})
 	if p.nftArgs.MihomoPort != 0 {
-		proxyConsts["mihomo_port"] = p.nftArgs.MihomoPort
+		ebpfConsts["mihomo_port"] = p.nftArgs.MihomoPort
 	}
 	if p.nftArgs.SingboxPort != 0 {
-		proxyConsts["singbox_port"] = p.nftArgs.SingboxPort
+		ebpfConsts["singbox_port"] = p.nftArgs.SingboxPort
 	}
+	
 	if p.nftArgs.EbpfEnable == "ebpf_true" && p.nftArgs.DnsHijack == "ebpf_hijack" {
+		ebpfConsts["enable_dns_hijack"] = uint8(1)
+		if addr, err := netip.ParseAddr(p.nftArgs.HijackDip4); err == nil && addr.Is4() {
+			b := addr.As4()
+			ebpfConsts["hjack_dip4"] = binary.LittleEndian.Uint32(b[:])
+		}
 		if addr, err := netip.ParseAddr(p.nftArgs.HijackDip6); err == nil && addr.Is6() {
-			proxyConsts["hjack_dip6"] = addr.As16()
-			proxyConsts["enable_dns_hijack"] = uint8(1)
+			ebpfConsts["hjack_dip6"] = addr.As16()
 		}
 	}
-	if len(proxyConsts) > 0 {
-		specProxy.RewriteConstants(proxyConsts)
+	
+	if len(ebpfConsts) > 0 {
+		if err := spec.RewriteConstants(ebpfConsts); err != nil {
+			return fmt.Errorf("rewrite constants error: %w", err)
+		}
 	}
 
-	var objsProxy struct {
-		IngressL2  *ebpf.Program `ebpf:"tc_ingress_l2"`
-		RouteRules *ebpf.Map     `ebpf:"route_rules"`
-		JmpDNS     *ebpf.Map     `ebpf:"jmp_dns"`
+	var objs struct {
+		IngressL2     *ebpf.Program `ebpf:"tc_ingress_l2"`
+		DnsHandler    *ebpf.Program `ebpf:"tc_dns_handler"`
+		RouteRules    *ebpf.Map     `ebpf:"route_rules"`
+		JmpDNS        *ebpf.Map     `ebpf:"jmp_dns"`
+		FastDnsCache  *ebpf.Map     `ebpf:"fast_dns_cache"`
+		RingbufEvents *ebpf.Map     `ebpf:"ringbuf_events"`
 	}
-	if err := specProxy.LoadAndAssign(&objsProxy, nil); err != nil {
-		return fmt.Errorf("load proxy error: %w", err)
+	
+	if err := spec.LoadAndAssign(&objs, nil); err != nil {
+		return fmt.Errorf("load combined ebpf error: %w", err)
 	}
-	p.ebpfMap = objsProxy.RouteRules
 
-	valMain := uint32(objsDNS.DnsMain.FD())
-	if err := objsProxy.JmpDNS.Update(&key0, &valMain, ebpf.UpdateAny); err != nil {
+	if p.nftArgs.EbpfXdp == "xdp_true" {
+		specXDP, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(xdpEbpfProg))
+		if err == nil {
+			if err := specXDP.RewriteConstants(ebpfConsts); err == nil {
+				collXDP, err := ebpf.NewCollectionWithOptions(specXDP, ebpf.CollectionOptions{
+					MapReplacements: map[string]*ebpf.Map{
+						"fast_dns_cache": objs.FastDnsCache,
+						"ringbuf_events": objs.RingbufEvents,
+					},
+				})
+				if err == nil {
+					l, err := link.AttachXDP(link.XDPOptions{
+						Interface: xdpLan.Index,
+						Program:   collXDP.Programs["xdp_dns_cache_entry"],
+					})
+					if err == nil {
+						p.xdpLink = l
+						log.Printf("[%s] XDP SUCCESS: DNS acceleration active on %s (Native Mode)", PluginType, xdpIfaceName)
+					} else {
+						log.Printf("[%s] XDP ATTACH ERROR on %s: %v", PluginType, xdpIfaceName, err)
+					}
+				} else {
+					log.Printf("[%s] XDP LOAD ERROR: %v", PluginType, err)
+				}
+			}
+		} else {
+			log.Printf("[%s] XDP SPEC ERROR: %v", PluginType, err)
+		}
+	}
+
+	p.ebpfPrograms = append(p.ebpfPrograms, objs.IngressL2, objs.DnsHandler)
+	p.ebpfMap = objs.RouteRules
+
+	key0 := uint32(0)
+	valHandler := uint32(objs.DnsHandler.FD())
+	if err := objs.JmpDNS.Update(&key0, &valHandler, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("failed to link main proxy to dns module: %w", err)
 	}
 
+	_ = objs.FastDnsCache.Pin("/sys/fs/bpf/mosdns_fast_cache")
+	_ = objs.RingbufEvents.Pin("/sys/fs/bpf/mosdns_ringbuf")
 	os.Remove("/sys/fs/bpf/mosdns_jmp_dns")
-	_ = objsProxy.JmpDNS.Pin("/sys/fs/bpf/mosdns_jmp_dns")
+	_ = objs.JmpDNS.Pin("/sys/fs/bpf/mosdns_jmp_dns")
+	os.Remove("/sys/fs/bpf/mosdns_dns_jmp")
 
 	l, err := link.AttachTCX(link.TCXOptions{
 		Interface: lan.Index,
-		Program:   objsProxy.IngressL2,
+		Program:   objs.IngressL2,
 		Attach:    ebpf.AttachTCXIngress,
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("attach tcx error: %w", err)
 	}
 	p.ebpfLinks = append(p.ebpfLinks, l)
 

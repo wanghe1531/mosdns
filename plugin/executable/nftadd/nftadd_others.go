@@ -46,6 +46,8 @@ type NftConfig struct {
 	DnsHijack  string `yaml:"dns_hijack"`
 	HijackDip4 string `yaml:"hjack_dip4"`
 	HijackDip6 string `yaml:"hjack_dip6"`
+	EbpfXdp      string `yaml:"xdp_enable"`
+	EbpfXdpIface string `yaml:"xdp_iface"`
 }
 
 // 模拟 Match 方法以满足可能的接口需求
