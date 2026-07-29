@@ -138,6 +138,7 @@ type NftAdd struct {
 	cancel          context.CancelFunc
 
 	startupDone  atomic.Bool
+	routingSetup atomic.Bool // true once setupRouting() has actually installed ip rules
 	ebpfLinks    []link.Link
 	ebpfMap      *ebpf.Map
 	ebpfPrograms []*ebpf.Program
@@ -237,8 +238,13 @@ func (p *NftAdd) Close() error {
 	os.Remove("/sys/fs/bpf/mosdns_ringbuf")
 	os.Remove("/sys/fs/bpf/mosdns_jmp_dns")
 	os.Remove("/sys/fs/bpf/mosdns_dns_jmp")
-	
-	p.cleanupRouting()
+
+	// Only tear down policy routing we actually set up. In nft_false/ebpf_false
+	// mode this plugin never calls setupRouting(), so it must not delete the
+	// ip rules (pref 1-5) that another tool installed.
+	if p.routingSetup.Load() {
+		p.cleanupRouting()
+	}
 	return nil
 }
 
@@ -418,6 +424,12 @@ func (p *NftAdd) setupRouting() {
 	p.runCmd("sysctl -w net.ipv4.conf.all.accept_local=1")
 	p.runCmd("sysctl -w net.ipv4.conf.lo.accept_local=1")
 	p.runCmd("sysctl -w net.ipv4.conf.all.route_localnet=1")
+
+	// Mark that we own these ip rules, so Close() only removes rules this
+	// plugin created. Without this, cleanupRouting() ran unconditionally and
+	// wiped pref 1-5 even in nft_false/ebpf_false mode — deleting policy-
+	// routing rules that belong to other tools (e.g. tc-tool) on every restart.
+	p.routingSetup.Store(true)
 }
 
 func (p *NftAdd) cleanupRouting() {
