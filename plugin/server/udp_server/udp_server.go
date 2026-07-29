@@ -23,11 +23,11 @@ import (
 )
 
 const (
-	PluginType       = "udp_server"
-	cacheSize        = 4194304 
-	assoc            = 4
-	groupCount       = cacheSize / assoc
-	groupMask        = groupCount - 1
+	PluginType = "udp_server"
+	cacheSize  = 4194304
+	assoc      = 4
+	groupCount = cacheSize / assoc
+	groupMask  = groupCount - 1
 
 	internalTTL      = 5
 	clientTTL        = 10
@@ -44,6 +44,7 @@ type Args struct {
 	Entry       string `yaml:"entry"`
 	Listen      string `yaml:"listen"`
 	EnableAudit bool   `yaml:"enable_audit"`
+	FastAccel   bool   `yaml:"fast_accel"` // 指定本 server 为极限加速落点；不填则回退到监听 :53 的 server
 }
 
 func (a *Args) init() {
@@ -75,7 +76,7 @@ type eBpfCacheVal struct {
 }
 
 type fastCacheItem struct {
-	hash      uint32 
+	hash      uint32
 	expire    int64
 	resp      []byte
 	updating  uint32
@@ -235,15 +236,17 @@ func (fc *fastCache) Store(resp []byte, dset string) {
 			}
 
 			oldestIdx := 0
-			var minExpire int64 = 1<<63 - 1 
-			
+			var minExpire int64 = 1<<63 - 1
+
 			for i := 0; i < assoc; i++ {
-			    item := group[i].Load()
-			    if item == nil { continue } 
-			    if exp := atomic.LoadInt64(&item.expire); exp < minExpire {
-			        minExpire = exp
-			        oldestIdx = i
-			    }
+				item := group[i].Load()
+				if item == nil {
+					continue
+				}
+				if exp := atomic.LoadInt64(&item.expire); exp < minExpire {
+					minExpire = exp
+					oldestIdx = i
+				}
 			}
 			group[oldestIdx].Store(newItem)
 		}
@@ -255,9 +258,16 @@ type fastHandler struct {
 	fc   *fastCache
 	dm   DomainMapperPlugin
 	sw   SwitchPlugin
+	reg  *fastReg
 }
 
 func (h *fastHandler) Handle(ctx context.Context, q *dns.Msg, meta server.QueryMeta, pack func(*dns.Msg) (*[]byte, error)) *[]byte {
+	fastResolveOnce.Do(func() { resolveFast(h.reg.bp) })
+	// 非极限加速落点：纯透传，绝不写共享快缓存（避免多分流序列相互污染）
+	if !h.reg.enabled.Load() {
+		meta.ClientAddr = meta.ClientAddr.Unmap()
+		return h.next.Handle(ctx, q, meta, pack)
+	}
 	meta.ClientAddr = meta.ClientAddr.Unmap()
 	payload := h.next.Handle(ctx, q, meta, pack)
 
@@ -284,6 +294,107 @@ func (h *fastHandler) Handle(ctx context.Context, q *dns.Msg, meta server.QueryM
 		h.fc.Store(*payload, dsetName)
 	}
 	return payload
+}
+
+// ===== 极限加速落点判定（惰性、跨 server 一次性解析）=====
+// 规则：只要有任意 server 配了 fast_accel=true，就只有这些 server 生效；否则回退到监听 :53
+// 的 server。生效判定与运行时 switch15 无关——switch15 仍在 FastBypass 内每查询门控开/关。
+type fastReg struct {
+	port      int
+	fastAccel bool
+	entry     string
+	fh        *fastHandler
+	bp        *coremain.BP
+	enabled   atomic.Bool
+}
+
+var (
+	fastMu           sync.Mutex
+	fastRegs         []*fastReg
+	fastResolveOnce  sync.Once
+	fastBackstopOnce sync.Once
+)
+
+func registerFast(r *fastReg) {
+	fastMu.Lock()
+	fastRegs = append(fastRegs, r)
+	fastMu.Unlock()
+}
+
+func resolveFast(bp *coremain.BP) {
+	fastMu.Lock()
+	defer fastMu.Unlock()
+	logger := bp.L()
+
+	anyFast := false
+	for _, r := range fastRegs {
+		if r.fastAccel {
+			anyFast = true
+			break
+		}
+	}
+	entries := map[string]struct{}{}
+	var enabled []*fastReg
+	for _, r := range fastRegs {
+		on := r.fastAccel || (!anyFast && r.port == 53)
+		r.enabled.Store(on)
+		if on {
+			enabled = append(enabled, r)
+			entries[r.entry] = struct{}{}
+		}
+	}
+
+	if len(entries) > 1 {
+		es := make([]string, 0, len(entries))
+		for e := range entries {
+			es = append(es, e)
+		}
+		logger.Warn("极限加速：多个不同分流序列的 server 同时命中，可能污染共享快缓存；请只在一套分流上配 fast_accel", zap.Strings("entries", es))
+	}
+	if len(enabled) == 0 {
+		if sw := bp.M().GetPlugin("switch15"); sw != nil {
+			if s, ok := sw.(SwitchPlugin); ok && s.GetValue() == "A" {
+				logger.Warn("极限加速：前端开关已开，但既无 fast_accel server 也无监听 :53 的 server，极限加速无落点、不会生效")
+			}
+		}
+	} else {
+		logger.Info("极限加速落点已确定", zap.Int("servers", len(enabled)))
+	}
+
+	// 仅为生效的 server 起 ringbuf 监听（且仅当 mosdns 自带 XDP 的 pin 存在时才接）。
+	for _, r := range enabled {
+		go ringbufLoop(bp, r.fh)
+	}
+}
+
+// ringbufLoop 只在 mosdns 自带 XDP 的 pin 存在时接入内核刷新事件；若一直不存在（未开 XDP），
+// 短暂尝试后退出，快缓存以纯用户态运行，不再无谓每 3 秒空转。
+func ringbufLoop(bp *coremain.BP, fh *fastHandler) {
+	logger := bp.L()
+	misses := 0
+	for {
+		rm, err := ebpf.LoadPinnedMap("/sys/fs/bpf/mosdns_ringbuf", nil)
+		if err != nil {
+			misses++
+			if misses > 20 {
+				logger.Info("极限加速：未发现 mosdns XDP ringbuf，快缓存以纯用户态运行")
+				return
+			}
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		misses = 0
+		rd, err := ringbuf.NewReader(rm)
+		if err != nil {
+			rm.Close()
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		startRingbufListener(bp, fh, rd)
+		rd.Close()
+		rm.Close()
+		time.Sleep(3 * time.Second)
+	}
 }
 
 func startRingbufListener(bp *coremain.BP, h *fastHandler, rd *ringbuf.Reader) {
@@ -350,17 +461,17 @@ func StartServer(bp *coremain.BP, args *Args) (*UdpServer, error) {
 		return nil, fmt.Errorf("failed to create socket, %w", err)
 	}
 
-	isEbpfPort := false
+	port := 0
 	if udpAddr, ok := c.LocalAddr().(*net.UDPAddr); ok {
-		if udpAddr.Port == 53 {
-			isEbpfPort = true
-		}
+		port = udpAddr.Port
 	}
+	// 候选 = 显式 fast_accel，或（向后兼容）监听 :53。最终生效由 resolveFast 跨 server 定夺。
+	candidate := args.FastAccel || port == 53
 
 	var wrappedHandler server.Handler = dh
-	var fastBypass func(int,[]byte, netip.AddrPort) (int, int, uint64, string)
+	var fastBypass func(int, []byte, netip.AddrPort) (int, int, uint64, string)
 
-	if isEbpfPort {
+	if candidate {
 		var dm DomainMapperPlugin
 		if p := bp.M().GetPlugin("unified_matcher1"); p != nil {
 			dm, _ = p.(DomainMapperPlugin)
@@ -372,34 +483,23 @@ func StartServer(bp *coremain.BP, args *Args) (*UdpServer, error) {
 		}
 
 		fc := newFastCache()
-		wrappedFastHandler := &fastHandler{next: dh, fc: fc, dm: dm, sw: sw15}
+		reg := &fastReg{port: port, fastAccel: args.FastAccel, entry: args.Entry, bp: bp}
+		wrappedFastHandler := &fastHandler{next: dh, fc: fc, dm: dm, sw: sw15, reg: reg}
+		reg.fh = wrappedFastHandler
+		registerFast(reg)
 		wrappedHandler = wrappedFastHandler
 
-		go func() {
-			for {
-				rm, err := ebpf.LoadPinnedMap("/sys/fs/bpf/mosdns_ringbuf", nil)
-				if err != nil {
-					time.Sleep(3 * time.Second)
-					continue
-				}
-				rd, err := ringbuf.NewReader(rm)
-				if err != nil {
-					rm.Close()
-					time.Sleep(3 * time.Second)
-					continue
-				}
-				startRingbufListener(bp, wrappedFastHandler, rd)
-				rd.Close()
-				rm.Close()
-				time.Sleep(3 * time.Second)
-			}
-		}()
-
-		fastBypass = buildFastBypass(bp, fc, c.(*net.UDPConn))
-		bp.L().Info("udp server started with eBPF fast-path", zap.Stringer("addr", c.LocalAddr()))
+		fastBypass = buildFastBypass(bp, fc, c.(*net.UDPConn), reg)
+		bp.L().Info("udp server is a fast-accel candidate", zap.Stringer("addr", c.LocalAddr()), zap.Bool("fast_accel", args.FastAccel))
 	} else {
-		bp.L().Info("udp server started normally (no eBPF fast-path)", zap.Stringer("addr", c.LocalAddr()))
+		bp.L().Info("udp server started normally (no fast-path)", zap.Stringer("addr", c.LocalAddr()))
 	}
+
+	// 兜底：即使没有任何查询（或根本没有候选 server），启动后也解析一次，用于"无落点"告警。
+	fastBackstopOnce.Do(func() {
+		b := bp
+		time.AfterFunc(10*time.Second, func() { fastResolveOnce.Do(func() { resolveFast(b) }) })
+	})
 
 	go func() {
 		defer c.Close()
@@ -412,13 +512,18 @@ func StartServer(bp *coremain.BP, args *Args) (*UdpServer, error) {
 	return &UdpServer{args: args, c: c}, nil
 }
 
-func buildFastBypass(bp *coremain.BP, fc *fastCache, conn *net.UDPConn) func(int,[]byte, netip.AddrPort) (int, int, uint64, string) {
+func buildFastBypass(bp *coremain.BP, fc *fastCache, conn *net.UDPConn, reg *fastReg) func(int, []byte, netip.AddrPort) (int, int, uint64, string) {
 	var once sync.Once
 	var sw15 SwitchPlugin
 	var dm DomainMapperPlugin
 	var ipSet IPSetPlugin
 
 	return func(reqLen int, buf []byte, remoteAddr netip.AddrPort) (int, int, uint64, string) {
+		fastResolveOnce.Do(func() { resolveFast(bp) })
+		// 非极限加速落点：直接放行到完整 handler，不做任何快路径逻辑。
+		if !reg.enabled.Load() {
+			return server.FastActionContinue, 0, 0, ""
+		}
 		once.Do(func() {
 			if p := bp.M().GetPlugin("switch15"); p != nil {
 				sw15, _ = p.(SwitchPlugin)
@@ -515,10 +620,10 @@ func buildFastBypass(bp *coremain.BP, fc *fastCache, conn *net.UDPConn) func(int
 			if (marks & (1 << 1)) != 0 {
 				return server.FastActionReply, makeReject(reqLen, buf, qtypeOff+4, 3), 0, ""
 			}
-			if (marks & (1 << 2)) != 0 && qtype == 1 {
+			if (marks&(1<<2)) != 0 && qtype == 1 {
 				return server.FastActionReply, makeReject(reqLen, buf, qtypeOff+4, 0), 0, ""
 			}
-			if (marks & (1 << 3)) != 0 && qtype == 28 {
+			if (marks&(1<<3)) != 0 && qtype == 28 {
 				return server.FastActionReply, makeReject(reqLen, buf, qtypeOff+4, 0), 0, ""
 			}
 		}
@@ -543,7 +648,7 @@ func buildFastBypass(bp *coremain.BP, fc *fastCache, conn *net.UDPConn) func(int
 			marks |= (1 << 30)
 		}
 
-		if (marks & (1 << 6)) != 0 || (marks & (1 << 30)) != 0 {
+		if (marks&(1<<6)) != 0 || (marks&(1<<30)) != 0 {
 			return server.FastActionContinue, 0, marks, dset
 		}
 
@@ -594,7 +699,7 @@ func buildFastBypass(bp *coremain.BP, fc *fastCache, conn *net.UDPConn) func(int
 
 						_, _ = conn.WriteToUDPAddrPort(bakedStale, remoteAddr)
 
-						return server.FastActionContinue, 0, marks|asyncRefreshMark, dset
+						return server.FastActionContinue, 0, marks | asyncRefreshMark, dset
 					}
 				}
 			}
