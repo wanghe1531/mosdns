@@ -294,7 +294,13 @@ func (c *AuditCollector) processBatch(batch []*auditContext) {
 			continue
 		}
 
-		clientAddr := qCtx.ServerMeta.ClientAddr.String()
+		// Prefer the real client IP conveyed by a trusted local forwarder
+		// (xdp-tool) via the private EDNS option; fall back to the transport peer.
+		auditAddr := qCtx.ServerMeta.ClientAddr
+		if qCtx.ServerMeta.RealClientAddr.IsValid() {
+			auditAddr = qCtx.ServerMeta.RealClientAddr
+		}
+		clientAddr := auditAddr.String()
 		if host, _, err := net.SplitHostPort(clientAddr); err == nil {
 			clientAddr = host
 		}

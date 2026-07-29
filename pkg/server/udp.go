@@ -102,13 +102,20 @@ func ServeUDP(c *net.UDPConn, h Handler, opts UDPServerOpts) error {
 			continue
 		}
 
+		meta := QueryMeta{
+			ClientAddr:       remoteAddr.Addr(),
+			FromUDP:          true,
+			PreFastFlags:     preMarks,
+			PreFastDomainSet: preDset,
+		}
+		// Consume+strip the private client-IP option (audit only; leaves the
+		// transport ClientAddr and everything downstream unchanged).
+		if real, ok := ExtractClientIP(q, remoteAddr.Addr()); ok {
+			meta.RealClientAddr = real
+		}
+
 		go func() {
-			payload := h.Handle(listenerCtx, q, QueryMeta{
-				ClientAddr:       remoteAddr.Addr(),
-				FromUDP:          true,
-				PreFastFlags:     preMarks,
-				PreFastDomainSet: preDset,
-			}, pool.PackBuffer)
+			payload := h.Handle(listenerCtx, q, meta, pool.PackBuffer)
 
 			if payload == nil {
 				return
